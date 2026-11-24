@@ -1,0 +1,88 @@
+MONITOR DE BATERÍA Y ENERGÍA
+============================
+
+Graba cada segundo el estado de la batería, el consumo y la temperatura de la CPU y la GPU,
+los FPS de los juegos, los procesos y los eventos de energía de Windows. Cada fila se escribe
+en el disco al momento, así que si el portátil se apaga de golpe los datos quedan guardados
+hasta el último segundo.
+
+CÓMO USARLO
+- Abrir: doble clic en MonitorBateria.exe. No arranca solo con Windows.
+- Con todos los datos: clic derecho > "Ejecutar como administrador", o el botón
+  "Reiniciar como administrador" de la ventana.
+- Saber si está grabando: el icono redondo junto al reloj de Windows (al pasar el ratón muestra
+  el estado) y la cabecera de la ventana:
+    verde  = grabando bien; el punto parpadea cada segundo
+    ámbar  = la batería está aportando energía estando enchufado (el cargador no da abasto)
+    rojo   = no llegan muestras o la batería no responde
+- Cerrar: botón "Detener y cerrar", la X de la ventana o el menú del icono (pide confirmación).
+  Minimizar la ventana no detiene nada.
+- Otro intervalo: "MonitorBateria.exe 2" graba cada 2 s (por defecto, cada 1 s).
+
+SI EL EQUIPO SE APAGA
+Al volver a encenderlo, abre el monitor ANTES de volver a abrir el juego. Revisa qué pasó con
+los eventos de Windows y deja un FIN_DE_SESION.txt dentro de la carpeta de la sesión cortada,
+junto con una copia del registro de la partida (el juego lo sobrescribe al abrirlo otra vez).
+
+QUÉ MIDE SEGÚN LOS PERMISOS
+                                         normal        administrador
+  Batería, CPU, GPU, temperaturas, RAM   sí            sí
+  FPS y tiempo de cada cuadro            no            sí (ETW, como PresentMon)
+  Procesos que se abren y cierran        cada 1 s      todos, aunque duren milisegundos,
+                                                       con su código de salida
+  Corriente y temperatura reales de la   no            sí, cada 2 s (datos del controlador de
+  batería, temperaturas y ventiladores                 MSI)
+  según el controlador del equipo
+La batería de este equipo no informa su temperatura a Windows, y Windows siempre muestra una
+tasa de carga de 0 aunque la batería se esté descargando. Por eso, con administrador, el aviso
+"la batería aporta energía estando enchufado" usa la corriente real que da el chip de la batería
+a través de MSI.
+
+DÓNDE GUARDA
+En C:\Users\<usuario>\MonitorBateria\registros\AAAA-MM-DD_HH-MM-SS\ (fuera de OneDrive, para
+que OneDrive no esté subiendo archivos que cambian cada segundo mientras juegas).
+- sistema.csv: una fila por segundo con la batería (%, mWh, tasa de carga o descarga en mW,
+  voltaje), el cargador, la CPU (uso, MHz, vatios, temperatura, limitación térmica), la GPU
+  (uso, vatios medios e instantáneos, temperatura, relojes, motivo de limitación), la RAM,
+  el juego abierto, sus FPS y el plan de energía.
+- fps.csv: FPS y tiempos de cuadro (medio, peor y percentil 99) de cada proceso que dibuja.
+- procesos.csv: cada 3 s, los procesos con más CPU y GPU, y los totales de Chrome, Discord,
+  Wallpaper Engine, Steam, los juegos, etc.
+- procesos_inicio_fin.csv: cada programa que se abre o se cierra, con su ruta, quién lo abrió,
+  cuánto vivió y su código de salida.
+- msi_wmi.csv: datos de MSI en crudo (solo con administrador; solo se apuntan los cambios).
+- eventos.csv: cambios importantes. Por ejemplo: se conecta o desconecta el cargador, empieza
+  o deja de cargar, la batería aporta energía estando enchufado, cambia la capacidad, cae el
+  voltaje de golpe, hay limitación térmica o de la GPU, se abre o cierra un juego, cambian las
+  pantallas o Windows registra un evento de energía.
+- info.txt: datos del equipo, la batería, las pantallas y el plan de energía al empezar.
+- informe_bateria_inicio.xml: informe de batería de Windows (powercfg /batteryreport).
+- juegos\: configuración gráfica al abrir cada juego y su registro al cerrarlo.
+- FIN_DE_SESION.txt: cómo terminó la sesión.
+
+CONSUMO
+Medido en este equipo con Rocket League abierto: 0,2 % de la CPU total y unos 100 MB de RAM
+(incluido nvidia-smi). Funciona con prioridad baja, así que el juego siempre tiene preferencia.
+Al cerrarlo no queda nada funcionando.
+
+Los CSV usan coma como separador y punto como decimal.
+
+ANALIZAR LO GRABADO
+Doble clic en "Analizar registros.bat". Analiza las sesiones de las últimas 24 horas y abre en el
+navegador un informe con:
+- Arriba: si el monitor grabó bien (inicio, fin, muestras, huecos, cómo terminó), los datos clave
+  de la batería, el consumo y las temperaturas, los juegos con sus horarios y FPS, las aplicaciones
+  abiertas, los procesos en segundo plano que más CPU usaron y la lista de lo raro que encontró
+  (grave, atención, info, bien).
+- Debajo, en secciones desplegables: cronología, batería y cargador (cada 20 minutos y según el
+  consumo), temperaturas y limitaciones, FPS, memoria, programas que se abrieron (con su firma
+  digital), eventos de Windows, los últimos 30 segundos grabados y todos los datos de MSI.
+Los informes se guardan en C:\Users\<usuario>\MonitorBateria\informes\.
+Otros periodos, desde PowerShell o el Símbolo del sistema en esta carpeta:
+  "Analizar registros.bat" -Horas 72
+  "Analizar registros.bat" -Todas
+  "Analizar registros.bat" -Sesion 2026-11-18_20-13-55
+No necesita administrador ni cambia nada del equipo. Tarda unos 20 s por cada 4-5 horas grabadas.
+
+RECOMPILAR
+compilar.bat usa el compilador de C# que ya trae Windows.
