@@ -149,6 +149,153 @@ function Firma([string]$ruta) {
     return $res
 }
 
+# ------------------------------------------------------------------ programas instalados
+
+# Carpeta en minúsculas y sin barra final; null si es demasiado corta para identificar nada
+function Normalizar([string]$d) {
+    if (-not $d) { return $null }
+    $d = $d.Trim().Trim('"').TrimEnd('\').ToLowerInvariant()
+    if ($d.Length -lt 4) { return $null }
+    return $d
+}
+
+# Carpeta del ejecutable que aparece en DisplayIcon o UninstallString ("C:\x\y.exe",0 o C:\x\y.exe /args)
+function Carpeta-De([string]$s) {
+    if (-not $s) { return $null }
+    $s = $s.Trim()
+    if ($s.StartsWith('"')) { $fin = $s.IndexOf('"', 1); if ($fin -gt 0) { $s = $s.Substring(1, $fin - 1) } }
+    else { $i = $s.ToLowerInvariant().IndexOf('.exe'); if ($i -gt 0) { $s = $s.Substring(0, $i + 4) } }
+    $s = $s -replace ',\s*-?\d+$', ''
+    if ($s -notmatch '^[a-zA-Z]:\\' -or $s -match '(?i)\\(msiexec|rundll32)\.exe$') { return $null }
+    try { return Normalizar ([IO.Path]::GetDirectoryName($s)) } catch { return $null }
+}
+
+$perfil = Normalizar $env:USERPROFILE
+$raices = @(
+    @{ Clave = 'pf'; Ruta = 'c:\program files\common files\' }, @{ Clave = 'pf'; Ruta = 'c:\program files (x86)\common files\' },
+    @{ Clave = 'pf'; Ruta = 'c:\program files\' }, @{ Clave = 'pf'; Ruta = 'c:\program files (x86)\' },
+    @{ Clave = 'lp'; Ruta = $perfil + '\appdata\local\programs\' }, @{ Clave = 'l'; Ruta = $perfil + '\appdata\local\' },
+    @{ Clave = 'r'; Ruta = $perfil + '\appdata\roaming\' }, @{ Clave = 'pd'; Ruta = 'c:\programdata\' }
+)
+# Carpetas demasiado generales: que un programa las declare no dice nada de lo que hay dentro
+$genericas = @('c:\program files', 'c:\program files (x86)', 'c:\program files\common files', 'c:\program files (x86)\common files',
+    'c:\programdata', 'c:\windows', 'c:\windows\system32', 'c:\windows\syswow64', $perfil, ($perfil + '\appdata\local'),
+    ($perfil + '\appdata\roaming'), ($perfil + '\appdata\local\programs'))
+
+# "Fabricante" de una carpeta: la primera carpeta bajo Archivos de programa, AppData, etc. (p. ej. pf:coccoc)
+function Clave-Fabricante([string]$dir) {
+    if (-not $dir) { return $null }
+    foreach ($r in $raices) {
+        if ($dir.StartsWith($r.Ruta)) {
+            $resto = $dir.Substring($r.Ruta.Length)
+            if ($resto) { return $r.Clave + ':' + ($resto -split '\\')[0] }
+        }
+    }
+    return $null
+}
+
+$instalados = $null
+function Cargar-Instalados {
+    $lista = New-Object System.Collections.Generic.List[object]
+    $claves = @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    foreach ($k in $claves) {
+        foreach ($e in @(Get-ItemProperty -Path $k -ErrorAction SilentlyContinue)) {
+            if (-not $e.DisplayName) { continue }
+            $candidatas = @((Normalizar $e.InstallLocation), (Carpeta-De $e.DisplayIcon), (Carpeta-De $e.UninstallString))
+            # Los juegos de Steam, Epic, etc. se desinstalan con el lanzador ("steam.exe steam://uninstall/..."):
+            # la carpeta del lanzador no es la del juego, así que solo vale su InstallLocation
+            if ([string]$e.UninstallString -match '://') { $candidatas = @((Normalizar $e.InstallLocation)) }
+            $dirs = $candidatas |
+                Where-Object { $_ -and $genericas -notcontains $_ -and $_ -notlike 'c:\windows\installer*' -and $_ -notlike 'c:\programdata\package cache*' } | Select-Object -Unique
+            $lista.Add([pscustomobject]@{
+                Nombre = [string]$e.DisplayName; Editor = [string]$e.Publisher; Version = [string]$e.DisplayVersion
+                Desinstalar = [string]$e.UninstallString; Oculto = ($e.SystemComponent -eq 1); Dirs = @($dirs)
+                Fabricantes = @($dirs | ForEach-Object { Clave-Fabricante $_ } | Where-Object { $_ } | Select-Object -Unique)
+            })
+        }
+    }
+    return ,$lista
+}
+
+# A qué programa instalado pertenece un ejecutable y cómo quitarlo
+$cacheProgramas = @{}
+function Identificar([string]$ruta) {
+    if (-not $ruta) { return $null }
+    if ($cacheProgramas.ContainsKey($ruta)) { return $cacheProgramas[$ruta] }
+    if ($script:instalados -eq $null) { $script:instalados = Cargar-Instalados }
+    $dir = Normalizar ([IO.Path]::GetDirectoryName($ruta))
+    $res = [pscustomobject]@{ Programa = ''; Editor = ''; Version = ''; Como = ''; Comando = ''; Carpeta = [IO.Path]::GetDirectoryName($ruta); Tipo = 'suelto'; Certeza = '' }
+    if ($dir -like 'c:\windows\system32\driverstore\filerepository\*') {
+        $inf = ($dir.Substring('c:\windows\system32\driverstore\filerepository\'.Length) -split '\\')[0] -replace '_amd64_[0-9a-f]+$', '' -replace '_x86_[0-9a-f]+$', ''
+        $res.Programa = 'Controlador (driver): ' + $inf; $res.Tipo = 'controlador'
+        $res.Como = 'Va con un controlador: se quita desde el Administrador de dispositivos o con el desinstalador del fabricante.'
+    }
+    elseif ($dir -like 'c:\windows*') { $res.Programa = 'Windows'; $res.Tipo = 'windows'; $res.Como = 'Es parte de Windows: no se desinstala.' }
+    elseif ($dir -like 'c:\program files\windowsapps\*') {
+        $paquete = (($dir.Substring('c:\program files\windowsapps\'.Length) -split '\\')[0] -split '_')[0]
+        $res.Programa = 'App de Microsoft Store: ' + $paquete; $res.Tipo = 'store'
+        $res.Como = 'Configuración > Aplicaciones > Aplicaciones instaladas > busca la app > Desinstalar.'
+        $res.Comando = 'Get-AppxPackage ' + $paquete + ' | Remove-AppxPackage'
+    }
+    elseif ($ruta -match '(?i)^[a-z]:\\(xboxgames|xbox)\\([^\\]+)') {
+        $res.Programa = 'Juego de Xbox: ' + $matches[2]; $res.Tipo = 'store'
+        $res.Como = 'Desde la app Xbox (Mi biblioteca > ... > Desinstalar) o Configuración > Aplicaciones > Aplicaciones instaladas.'
+    }
+    else {
+        # 1) El programa cuya carpeta contiene al ejecutable (la más concreta gana)
+        $mejor = $null; $largo = 0
+        foreach ($p in $script:instalados) {
+            foreach ($d in $p.Dirs) {
+                if (($dir -eq $d -or $dir.StartsWith($d + '\')) -and ($d.Length -gt $largo -or ($d.Length -eq $largo -and $mejor.Oculto -and -not $p.Oculto))) { $mejor = $p; $largo = $d.Length }
+            }
+        }
+        # 2) Si no, el del mismo fabricante (p. ej. el actualizador de CocCoc está en otra carpeta que el
+        #    navegador). Primero con la misma raíz (Archivos de programa, AppData...) y luego con cualquiera.
+        if ($mejor -eq $null) {
+            $clave = Clave-Fabricante $dir
+            if ($clave) {
+                $fabricante = $clave.Substring($clave.IndexOf(':') + 1)
+                $candidatos = @($script:instalados | Where-Object { $_.Fabricantes -contains $clave })
+                if ($candidatos.Count -eq 0) { $candidatos = @($script:instalados | Where-Object { @($_.Fabricantes | Where-Object { $_.EndsWith(':' + $fabricante) }).Count -gt 0 }) }
+                if ($candidatos.Count -gt 0) {
+                    # Mejor el que se llame como la carpeta que sigue a la del fabricante (p. ej. "NVIDIA app")
+                    $siguiente = ''
+                    $i = $dir.IndexOf('\' + $fabricante + '\')
+                    if ($i -ge 0) { $siguiente = ($dir.Substring($i + $fabricante.Length + 2) -split '\\')[0] }
+                    $candidatos = @($candidatos | Sort-Object { if ($siguiente -and $_.Nombre.ToLowerInvariant().Contains($siguiente)) { 0 } else { 1 } }, Oculto)
+                    $mejor = $candidatos[0]
+                    $otros = @($candidatos | Select-Object -ExpandProperty Nombre -Unique | Where-Object { $_ -ne $mejor.Nombre })
+                    $res.Certeza = 'deducido por la carpeta del fabricante'
+                    if ($otros.Count -gt 0) { $res.Certeza += '; también podría ser: ' + (@($otros | Select-Object -First 3) -join ', ') }
+                }
+            }
+        }
+        if ($mejor -ne $null) {
+            $res.Programa = $mejor.Nombre; $res.Editor = $mejor.Editor; $res.Version = $mejor.Version; $res.Comando = $mejor.Desinstalar; $res.Tipo = 'instalado'
+            if ($mejor.Dirs.Count -gt 0) { $res.Carpeta = $mejor.Dirs[0] }
+            if ($mejor.Desinstalar -match 'steam://uninstall') { $res.Como = 'Desde Steam: Biblioteca > clic derecho en el juego > Administrar > Desinstalar.' }
+            elseif ($mejor.Oculto) { $res.Como = 'Es un componente oculto de otro programa: se quita al desinstalar el programa principal.' }
+            else { $res.Como = 'Configuración > Aplicaciones > Aplicaciones instaladas > busca «' + $mejor.Nombre + '» > Desinstalar.' }
+        }
+        else {
+            $res.Programa = '(no figura como programa instalado)'
+            $res.Como = 'No tiene desinstalador registrado: puede ser un programa portátil o haberlo dejado otro. Para quitarlo, ciérralo y borra su carpeta, solo si sabes qué es.'
+            if ($ruta -match '(?i)\\AppData\\Local\\Temp\\') { $res.Como = 'Se ejecutó desde la carpeta temporal: revísalo con el antivirus antes de nada.' }
+        }
+    }
+    $cacheProgramas[$ruta] = $res
+    return $res
+}
+
+function Texto-Programa($id) {
+    if ($id -eq $null) { return '' }
+    $t = $id.Programa
+    if ($id.Editor) { $t += ', de ' + $id.Editor }
+    if ($id.Certeza) { $t += ' (' + $id.Certeza + ')' }
+    return $t
+}
+
 # Eventos de Windows relacionados con energía, hardware y bloqueos en un intervalo
 function Eventos-Windows([datetime]$desde, [datetime]$hasta) {
     $lista = New-Object System.Collections.Generic.List[object]
@@ -537,6 +684,36 @@ function Analizar-Sesion($ses) {
     }
     $tablaFps = @($tablaFps | Sort-Object _N -Descending)
 
+    # --- ubicación de cada programa (las sesiones antiguas solo la tienen para los procesos que se abrieron)
+    $rutasPorNombre = @{}
+    foreach ($archivo in 'procesos_al_inicio.csv', 'rutas_procesos.csv', 'procesos_inicio_fin.csv', 'procesos_nuevos.csv') {
+        $tr = Leer-Tabla (Join-Path $r $archivo)
+        if (-not $tr.Col.ContainsKey('nombre') -or -not $tr.Col.ContainsKey('ruta')) { continue }
+        $cN = $tr.Col['nombre']; $cR = $tr.Col['ruta']
+        foreach ($f in $tr.Filas) {
+            $nom = $f[$cN]; $ru = $f[$cR]
+            if (-not $nom -or -not $ru) { continue }
+            $lr = $rutasPorNombre[$nom]
+            if ($lr -eq $null) { $lr = New-Object System.Collections.Generic.List[string]; $rutasPorNombre[$nom] = $lr }
+            if (-not $lr.Contains($ru)) { $lr.Add($ru) }
+        }
+    }
+    $hayRutas = Test-Path -LiteralPath (Join-Path $r 'rutas_procesos.csv')
+    function Ubicacion([string]$nombre) {
+        $lr = $rutasPorNombre[$nombre]
+        if ($lr -eq $null -or $lr.Count -eq 0) {
+            if (-not $hayRutas) { return '(no consta: sesión grabada con una versión anterior del monitor)' }
+            return '(Windows no dio la ubicación: proceso protegido; con administrador se obtienen casi todas)'
+        }
+        if ($lr.Count -le 2) { return ($lr -join ' · ') }
+        return ($lr[0] + ' · ' + $lr[1] + ' (y ' + ($lr.Count - 2) + ' más)')
+    }
+    function Programa-De([string]$nombre) {
+        $lr = $rutasPorNombre[$nombre]
+        if ($lr -eq $null -or $lr.Count -eq 0) { return '' }
+        return Texto-Programa (Identificar $lr[0])
+    }
+
     # --- procesos.csv: aplicaciones y procesos en segundo plano
     $grupos = @{}; $fondo = @{}
     $nTot = 0; $sumTotCpu = 0.0; $maxTotCpu = 0.0; $maxTotPriv = 0.0
@@ -586,12 +763,12 @@ function Analizar-Sesion($ses) {
     $nTotDiv = [math]::Max(1, $nTot)
     $tablaApps = @(foreach ($nom in $grupos.Keys) {
         $g = $grupos[$nom]
-        [pscustomobject]@{ Aplicación = $nom; 'Tiempo abierta' = (Dur ($g.N * $intProc)); 'CPU media' = (Fmt ($g.SumCpu / $nTotDiv) 1 ' %'); 'CPU máxima' = (Fmt $g.MaxCpu 0 ' %'); 'Memoria máx.' = (Fmt $g.MaxPriv 0 ' MB'); 'Procesos' = $g.MaxInst; _Cpu = $g.SumCpu }
+        [pscustomobject]@{ Aplicación = $nom; 'Tiempo abierta' = (Dur ($g.N * $intProc)); 'CPU media' = (Fmt ($g.SumCpu / $nTotDiv) 1 ' %'); 'CPU máxima' = (Fmt $g.MaxCpu 0 ' %'); 'Memoria máx.' = (Fmt $g.MaxPriv 0 ' MB'); 'Procesos' = $g.MaxInst; Ubicación = (Ubicacion $nom); 'Programa instalado' = (Programa-De $nom); _Cpu = $g.SumCpu }
     }) | Sort-Object _Cpu -Descending
     $tablaFondo = @(foreach ($nom in $fondo.Keys) {
         if ($grupos.ContainsKey($nom) -or $nom -eq 'System' -or $nom -eq 'Idle') { continue }
         $g = $fondo[$nom]
-        [pscustomobject]@{ Proceso = $nom; 'Veces entre los que más CPU usaban' = $g.N; 'CPU media' = (Fmt ($g.SumCpu / $nTotDiv) 2 ' %'); 'CPU máxima' = (Fmt $g.MaxCpu 1 ' %'); 'Memoria máx.' = (Fmt $g.MaxPriv 0 ' MB'); _Cpu = $g.SumCpu }
+        [pscustomobject]@{ Proceso = $nom; 'Veces entre los que más CPU usaban' = $g.N; 'CPU media' = (Fmt ($g.SumCpu / $nTotDiv) 2 ' %'); 'CPU máxima' = (Fmt $g.MaxCpu 1 ' %'); 'Memoria máx.' = (Fmt $g.MaxPriv 0 ' MB'); Ubicación = (Ubicacion $nom); 'Programa instalado' = (Programa-De $nom); _Cpu = $g.SumCpu }
     }) | Sort-Object _Cpu -Descending
 
     # --- procesos que se abrieron y cerraron
@@ -629,7 +806,7 @@ function Analizar-Sesion($ses) {
             $cod = $f[$iCod]
             if ($codigosFallo.ContainsKey($cod)) {
                 $o.Fallos = $o.Fallos + 1
-                $fallos.Add([pscustomobject]@{ Hora = $f[$iHora].Substring(11, 8); Proceso = $nom; Código = $cod; Significado = $codigosFallo[$cod] })
+                $fallos.Add([pscustomobject]@{ Hora = $f[$iHora].Substring(11, 8); Proceso = $nom; Código = $cod; Significado = $codigosFallo[$cod]; Ubicación = (Ubicacion $nom) })
             }
         }
     }
@@ -641,10 +818,37 @@ function Analizar-Sesion($ses) {
         # Las apps de Microsoft Store van firmadas como paquete, no archivo por archivo
         if ($o.Ruta -match '^(?i)C:\\Program Files\\WindowsApps\\') { $firma = 'app de Microsoft Store' }
         elseif ($o.Ruta -and $o.Ruta -notmatch '^(?i)C:\\Windows\\') { $firma = Firma $o.Ruta }
-        [pscustomobject]@{ Programa = $o.Nombre; Veces = $o.Inicios; 'Duraron < 2 s' = $o.Fugaces; 'Lo abrió' = $padres; Ruta = $o.Ruta; Firma = $firma; _N = $o.Inicios }
+        $id = Identificar $o.Ruta
+        $como = ''
+        if ($id -ne $null) { $como = $id.Como }
+        $tipo = ''
+        if ($id -ne $null) { $tipo = $id.Tipo }
+        [pscustomobject]@{ Programa = $o.Nombre; Veces = $o.Inicios; 'Duraron < 2 s' = $o.Fugaces; 'Lo abrió' = $padres; Ubicación = $o.Ruta; 'Programa instalado' = (Texto-Programa $id); Firma = $firma; 'Cómo quitarlo' = $como; _N = $o.Inicios; _Tipo = $tipo }
     }) | Sort-Object _N -Descending
-    $raros = @($tablaLanz | Where-Object { $_.Firma -like 'SIN FIRMA*' -or $_.Ruta -match '(?i)\\AppData\\Local\\Temp\\|\\Downloads\\|\\Users\\Public\\' })
-    $noDeseados = @($tablaLanz | Where-Object { $_.Programa -match $patronNoDeseados -or $_.Ruta -match $patronNoDeseados })
+    # Sin firma y sin un programa instalado detrás, o desde carpetas donde no suele haber programas
+    $raros = @($tablaLanz | Where-Object { ($_.Firma -like 'SIN FIRMA*' -and $_._Tipo -ne 'instalado' -and $_._Tipo -ne 'store') -or $_.Ubicación -match '(?i)\\AppData\\Local\\Temp\\|\\Downloads\\|\\Users\\Public\\' })
+    $sinFirmaConocidos = @($tablaLanz | Where-Object { $_.Firma -like 'SIN FIRMA*' -and ($_._Tipo -eq 'instalado' -or $_._Tipo -eq 'store') })
+    $noDeseados = @($tablaLanz | Where-Object { $_.Programa -match $patronNoDeseados -or $_.Ubicación -match $patronNoDeseados -or $_.'Programa instalado' -match $patronNoDeseados })
+
+    # Programas instalados a los que pertenece todo lo que se vio ejecutarse (sin contar Windows)
+    $porPrograma = @{}
+    foreach ($nom in $rutasPorNombre.Keys) {
+        foreach ($ru in $rutasPorNombre[$nom]) {
+            $id = Identificar $ru
+            if ($id -eq $null -or $id.Tipo -eq 'windows') { continue }
+            $clave = Texto-Programa $id
+            if ($id.Tipo -eq 'suelto') { $clave += ' ' + $id.Carpeta }
+            $g = $porPrograma[$clave]
+            if ($g -eq $null) { $g = @{ Id = $id; Ejecutables = New-Object System.Collections.Generic.List[string] }; $porPrograma[$clave] = $g }
+            if (-not $g.Ejecutables.Contains($nom)) { $g.Ejecutables.Add($nom) }
+        }
+    }
+    $ordenTipo = @{ suelto = 0; instalado = 1; store = 2; controlador = 3 }
+    $tablaInstalados = @(foreach ($clave in $porPrograma.Keys) {
+        $g = $porPrograma[$clave]; $id = $g.Id
+        $tipo = @{ suelto = 'Sin desinstalador'; instalado = 'Programa instalado'; store = 'App de la Store'; controlador = 'Controlador' }[$id.Tipo]
+        [pscustomobject]@{ 'Programa instalado' = (Texto-Programa $id); Versión = $id.Version; Tipo = $tipo; Ejecutables = ($g.Ejecutables -join ', '); Carpeta = $id.Carpeta; 'Cómo quitarlo' = $id.Como; 'Comando de desinstalación' = $id.Comando; _O = $ordenTipo[$id.Tipo]; _N = $id.Programa }
+    }) | Sort-Object _O, _N
 
     # --- eventos de Windows durante la sesión (y el arranque siguiente, si se cortó la luz)
     $evWin = Eventos-Windows $t0 $tUlt.AddHours(6)
@@ -759,8 +963,20 @@ function Analizar-Sesion($ses) {
     foreach ($e in @($evWin | Where-Object { $_.Nivel -eq 'atencion' } | Group-Object Texto)) { Hallazgo 'atencion' ($e.Group[0].Hora + ' · ' + $e.Name + $(if ($e.Count -gt 1) { ' (' + $e.Count + ' veces)' } else { '' })) }
     foreach ($e in @($evWin | Where-Object { $_.Nivel -eq 'info' } | Group-Object Texto)) { Hallazgo 'info' ($e.Name + $(if ($e.Count -gt 1) { ' (' + $e.Count + ' veces)' } else { '' })) }
     if ($fallos.Count -gt 0) { Hallazgo 'atencion' ('Se cerraron por un error ' + $fallos.Count + ' procesos: ' + ((@($fallos | Group-Object Proceso | ForEach-Object { $_.Name + ' (' + $_.Count + ')' })) -join ', ') + '.') }
-    foreach ($o in $noDeseados) { Hallazgo 'atencion' ('Programa no deseado activo: ' + $o.Programa + ' se ejecutó ' + $o.Veces + ' veces (' + $o.Ruta + '). Si no lo instalaste a propósito, desinstálalo.') }
-    foreach ($o in $raros) { Hallazgo 'atencion' ('Proceso a revisar: ' + $o.Programa + ' (' + $o.Ruta + '), ' + $o.Firma + '.') }
+    foreach ($o in $noDeseados) {
+        Hallazgo 'atencion' ('Programa no deseado activo: ' + $o.Programa + ' se ejecutó ' + $o.Veces + ' veces. Ubicación: ' + $o.Ubicación + '. Pertenece a: ' +
+            $o.'Programa instalado' + '. Si no lo instalaste a propósito, desinstálalo así: ' + $o.'Cómo quitarlo')
+    }
+    foreach ($o in $raros) {
+        Hallazgo 'atencion' ('Proceso a revisar: ' + $o.Programa + ', ' + $o.Firma + '. Ubicación: ' + $o.Ubicación + '. Pertenece a: ' + $o.'Programa instalado' + '. ' + $o.'Cómo quitarlo')
+    }
+    if ($sinFirmaConocidos.Count -gt 0) {
+        Hallazgo 'info' ('Sin firma digital, pero pertenecen a programas instalados: ' + ((@($sinFirmaConocidos | ForEach-Object { $_.Programa + ' (' + ($_.'Programa instalado' -replace ',.*$', '') + ')' })) -join ', ') + '. Es habitual en juegos.')
+    }
+    $deTerceros = @($tablaInstalados | Where-Object { $_.Tipo -ne 'Controlador' })
+    if ($deTerceros.Count -gt 0) {
+        Hallazgo 'info' ('Además de Windows, se ejecutaron programas de ' + $deTerceros.Count + ' aplicaciones instaladas. En el detalle, «Programas instalados detrás de lo que se ejecutó», tienes la ubicación de cada uno y cómo desinstalarlo.')
+    }
     if ($raros.Count -eq 0 -and $tablaLanz.Count -gt 0) { Hallazgo 'ok' ('Los ' + $totalInicios + ' procesos que se abrieron tienen firma válida o son de Windows; ' + $totalFugaces + ' duraron menos de 2 segundos.') }
     $juegosRapidos = @($tablaFps | Where-Object { $_._Media -gt 90 -and $_.Proceso -match '(?i)rocketleague|aoe|reliccardinal|frostpunk' })
     if ($juegosRapidos.Count -gt 0 -and ($mahAc -gt 20 -or $segGT86 -gt 300)) {
@@ -821,8 +1037,8 @@ function Analizar-Sesion($ses) {
         [pscustomobject]@{ Juego = $jj.Juego; Desde = $jj.Desde.ToString('HH:mm'); Hasta = $jj.Hasta.ToString('HH:mm'); Duración = (Dur ($jj.Hasta - $jj.Desde).TotalSeconds); 'FPS medio' = $fpsTxt; 'CPU+GPU medio' = (Fmt ($jj.SumW / [math]::Max(1, $jj.NW)) 0 ' W'); 'GPU máx.' = (Fmt $jj.MaxGT 0 ' °C') }
     })
     [void]$sbR.Append('<div><h3>Juegos</h3>' + (Html-Tabla $tablaJuegos @('Juego', 'Desde', 'Hasta', 'Duración', 'FPS medio', 'CPU+GPU medio', 'GPU máx.') @('FPS medio', 'CPU+GPU medio', 'GPU máx.')) + '</div></div>')
-    [void]$sbR.Append('<div class="dos"><div><h3>Aplicaciones abiertas</h3>' + (Html-Tabla @($tablaApps | Select-Object -First 10) @('Aplicación', 'Tiempo abierta', 'CPU media', 'Memoria máx.') @('CPU media', 'Memoria máx.')) + '</div>')
-    [void]$sbR.Append('<div><h3>En segundo plano (los que más CPU usaron)</h3>' + (Html-Tabla @($tablaFondo | Select-Object -First 10) @('Proceso', 'CPU media', 'CPU máxima', 'Memoria máx.') @('CPU media', 'CPU máxima', 'Memoria máx.')) + '</div></div>')
+    [void]$sbR.Append('<h3>Aplicaciones abiertas</h3>' + (Html-Tabla @($tablaApps | Select-Object -First 10) @('Aplicación', 'Tiempo abierta', 'CPU media', 'Memoria máx.', 'Ubicación') @('CPU media', 'Memoria máx.')))
+    [void]$sbR.Append('<h3>En segundo plano (los que más CPU usaron)</h3>' + (Html-Tabla @($tablaFondo | Select-Object -First 10) @('Proceso', 'CPU media', 'CPU máxima', 'Memoria máx.', 'Ubicación') @('CPU media', 'CPU máxima', 'Memoria máx.')))
 
     # ================================================================== detalle (HTML)
 
@@ -863,10 +1079,13 @@ function Analizar-Sesion($ses) {
     if ($enRamMin.Count -gt 0) { $htmlMem += '<h4>Lo que más memoria ocupaba en ese momento</h4>' + (Html-Tabla @($enRamMin | Sort-Object _Priv -Descending | Select-Object -First 10) @('Aplicación', 'Instancias', 'Memoria privada', 'En RAM') @('Instancias', 'Memoria privada', 'En RAM')) }
     Seccion 'Memoria' $htmlMem
 
-    $htmlProc = '<h4>Aplicaciones (todas las vigiladas)</h4>' + (Html-Tabla $tablaApps @('Aplicación', 'Tiempo abierta', 'CPU media', 'CPU máxima', 'Memoria máx.', 'Procesos') @('CPU media', 'CPU máxima', 'Memoria máx.', 'Procesos'))
-    $htmlProc += '<h4>Procesos en segundo plano que usaron CPU</h4><p class="tenue">Solo se registran los que estaban entre los que más CPU usaban en cada momento.</p>' + (Html-Tabla $tablaFondo @('Proceso', 'Veces entre los que más CPU usaban', 'CPU media', 'CPU máxima', 'Memoria máx.') @('Veces entre los que más CPU usaban', 'CPU media', 'CPU máxima', 'Memoria máx.'))
-    $htmlProc += '<h4>Programas que se abrieron (' + $totalInicios + ', ' + $totalFugaces + ' duraron menos de 2 s)</h4>' + (Html-Tabla $tablaLanz @('Programa', 'Veces', 'Duraron < 2 s', 'Lo abrió', 'Ruta', 'Firma') @('Veces', 'Duraron < 2 s'))
-    if ($fallos.Count -gt 0) { $htmlProc += '<h4>Procesos que se cerraron por un error</h4>' + (Html-Tabla $fallos @('Hora', 'Proceso', 'Código', 'Significado')) }
+    Seccion 'Programas instalados detrás de lo que se ejecutó' ('<p class="tenue">A qué programa pertenece cada ejecutable que se vio funcionar (sin contar los de Windows) y cómo desinstalarlo. «Probable» quiere decir que se dedujo por la carpeta del fabricante. Antes de desinstalar algo, asegúrate de que no lo necesitas.</p>' +
+        (Html-Tabla $tablaInstalados @('Programa instalado', 'Versión', 'Tipo', 'Ejecutables', 'Carpeta', 'Cómo quitarlo', 'Comando de desinstalación')))
+
+    $htmlProc = '<h4>Aplicaciones (todas las vigiladas)</h4>' + (Html-Tabla $tablaApps @('Aplicación', 'Tiempo abierta', 'CPU media', 'CPU máxima', 'Memoria máx.', 'Procesos', 'Ubicación', 'Programa instalado') @('CPU media', 'CPU máxima', 'Memoria máx.', 'Procesos'))
+    $htmlProc += '<h4>Procesos en segundo plano que usaron CPU</h4><p class="tenue">Solo se registran los que estaban entre los que más CPU usaban en cada momento.</p>' + (Html-Tabla $tablaFondo @('Proceso', 'Veces entre los que más CPU usaban', 'CPU media', 'CPU máxima', 'Memoria máx.', 'Ubicación', 'Programa instalado') @('Veces entre los que más CPU usaban', 'CPU media', 'CPU máxima', 'Memoria máx.'))
+    $htmlProc += '<h4>Programas que se abrieron (' + $totalInicios + ', ' + $totalFugaces + ' duraron menos de 2 s)</h4>' + (Html-Tabla $tablaLanz @('Programa', 'Veces', 'Duraron < 2 s', 'Lo abrió', 'Ubicación', 'Programa instalado', 'Firma', 'Cómo quitarlo') @('Veces', 'Duraron < 2 s'))
+    if ($fallos.Count -gt 0) { $htmlProc += '<h4>Procesos que se cerraron por un error</h4>' + (Html-Tabla $fallos @('Hora', 'Proceso', 'Código', 'Significado', 'Ubicación')) }
     if ($antiguo) { $htmlProc += '<p class="tenue">Sesión de una versión anterior del monitor: solo hay inicios de procesos, sin cierres.</p>' }
     Seccion 'Aplicaciones y procesos en segundo plano' $htmlProc
 

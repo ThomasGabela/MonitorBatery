@@ -17,6 +17,8 @@ CÓMO USARLO
     rojo   = no llegan muestras o la batería no responde
 - Cerrar: botón "Detener y cerrar", la X de la ventana o el menú del icono (pide confirmación).
   Minimizar la ventana no detiene nada.
+- Pestaña "Programas que se abren y su ubicación": cada programa que se abre, con la ruta de su
+  archivo y quién lo abrió. Doble clic en uno para verlo en el Explorador.
 - Otro intervalo: "MonitorBateria.exe 2" graba cada 2 s (por defecto, cada 1 s).
 
 SI EL EQUIPO SE APAGA
@@ -50,6 +52,10 @@ que OneDrive no esté subiendo archivos que cambian cada segundo mientras juegas
   Wallpaper Engine, Steam, los juegos, etc.
 - procesos_inicio_fin.csv: cada programa que se abre o se cierra, con su ruta, quién lo abrió,
   cuánto vivió y su código de salida.
+- procesos_al_inicio.csv: todo lo que ya estaba abierto al arrancar el monitor, con su ruta.
+- rutas_procesos.csv: la ubicación de cada programa que aparece durante la sesión (una fila por
+  cada nombre + ruta distinta). Sin administrador, Windows no da la ruta de los procesos
+  protegidos (servicios del sistema, antivirus...).
 - msi_wmi.csv: datos de MSI en crudo (solo con administrador; solo se apuntan los cambios).
 - eventos.csv: cambios importantes. Por ejemplo: se conecta o desconecta el cargador, empieza
   o deja de cargar, la batería aporta energía estando enchufado, cambia la capacidad, cae el
@@ -77,6 +83,11 @@ navegador un informe con:
 - Debajo, en secciones desplegables: cronología, batería y cargador (cada 20 minutos y según el
   consumo), temperaturas y limitaciones, FPS, memoria, programas que se abrieron (con su firma
   digital), eventos de Windows, los últimos 30 segundos grabados y todos los datos de MSI.
+- Cada aplicación y proceso lleva su ubicación y el programa instalado al que pertenece. La
+  sección "Programas instalados detrás de lo que se ejecutó" dice cómo desinstalar cada uno:
+  desde Configuración > Aplicaciones (con el nombre exacto con el que aparece ahí), desde Steam,
+  desde la app Xbox o la Store, o si es parte de Windows o de un controlador y no se desinstala.
+  También muestra el comando de desinstalación que registró el propio programa.
 Los informes se guardan en C:\Users\<usuario>\MonitorBateria\informes\.
 Otros periodos, desde PowerShell o el Símbolo del sistema en esta carpeta:
   "Analizar registros.bat" -Horas 72

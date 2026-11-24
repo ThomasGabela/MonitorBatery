@@ -43,7 +43,16 @@ namespace MonitorBateria
         internal static bool EsAdmin;
         internal static string DirRegistros, DirSesion;
         static string archivoActiva;
-        static Registro logSistema, logProcesos, logEventos, logNuevos, logFps, logMsi;
+        static Registro logSistema, logProcesos, logEventos, logNuevos, logFps, logMsi, logRutas;
+
+        // Ruta de cada proceso (se pregunta una sola vez por proceso) y combinaciones nombre + ruta ya anotadas
+        static readonly Dictionary<int, KeyValuePair<long, string>> rutaPorPid = new Dictionary<int, KeyValuePair<long, string>>();
+        static readonly HashSet<string> rutasVistas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static readonly object lockRutas = new object();
+
+        // Programas que se van abriendo, para la pestaña de la ventana
+        static readonly LinkedList<ProgramaAbierto> abiertos = new LinkedList<ProgramaAbierto>();
+        static long secuenciaAbiertos;
         static readonly LinkedList<string> eventosRecientes = new LinkedList<string>();
         static readonly object lockEventos = new object();
         internal static volatile int VersionEventos;
@@ -221,6 +230,7 @@ namespace MonitorBateria
                 "fecha_hora,evento,pid,pid_padre,padre,nombre,ruta,codigo_salida,vida_s");
             logFps = new Registro(Path.Combine(DirSesion, "fps.csv"),
                 "fecha_hora,pid,nombre,cuadros,fps,frametime_prom_ms,frametime_max_ms,frametime_p99_ms");
+            logRutas = new Registro(Path.Combine(DirSesion, "rutas_procesos.csv"), "fecha_hora,pid,nombre,ruta");
 
             IniciarFuncionesAdmin();
             EscribirInfo();
@@ -364,6 +374,7 @@ namespace MonitorBateria
 
             // Procesos y FPS
             procs.Muestrear();
+            if (k == 0) InventarioInicial(ahora);
             RegistrarProcesosPorSondeo(ahora);
             ActualizarJuegos();
             if (k % CadaProcesos == 0) gpuPorPid = gpuMot.Leer();
@@ -382,6 +393,7 @@ namespace MonitorBateria
                 EscribirProcesos(ahora);
                 logProcesos.Volcar();
                 logNuevos.Volcar();
+                logRutas.Volcar();
             }
             if (k % 30 == 0 || k == 5) MedirPropio(ahora, k);
             UltimaLectura = l;
@@ -486,6 +498,7 @@ namespace MonitorBateria
                 elegidos[p.Pid] = p;
             foreach (var p in elegidos.Values.OrderByDescending(x => x.CpuPct))
             {
+                RutaDe(p);   // anota su ubicación en rutas_procesos.csv la primera vez que aparece
                 UsoGpu u;
                 gpu.TryGetValue(p.Pid, out u);
                 logProcesos.Linea(FilaProceso(h, "top", p.Pid, p.Nombre, 1, p.CpuPct, p.WorkingSet, p.Privada, p.Hilos, u));
@@ -495,6 +508,7 @@ namespace MonitorBateria
                 UsoGpu mejor = null;
                 foreach (var p in grupo)
                 {
+                    RutaDe(p);
                     UsoGpu u;
                     if (gpu.TryGetValue(p.Pid, out u) && (mejor == null || u.Pct > mejor.Pct)) mejor = u;
                 }
@@ -511,6 +525,65 @@ namespace MonitorBateria
                 u == null ? "" : F(u.Pct, 1), u == null ? "" : u.Motor, u == null ? "" : (u.Dgpu ? "dGPU" : "iGPU"));
         }
 
+        // Ubicación del ejecutable de un proceso; la primera vez que aparece una combinación
+        // nombre + ruta se anota en rutas_procesos.csv
+        static string RutaDe(InfoProc p)
+        {
+            lock (lockRutas)
+            {
+                KeyValuePair<long, string> r;
+                if (rutaPorPid.TryGetValue(p.Pid, out r) && r.Key == p.Creacion) return r.Value;
+                string ruta = p.Pid <= 4 ? "" : RutaProceso(p.Pid);
+                rutaPorPid[p.Pid] = new KeyValuePair<long, string>(p.Creacion, ruta);
+                AnotarRuta(p.Pid, p.Nombre, ruta);
+                return ruta;
+            }
+        }
+
+        static void AnotarRuta(int pid, string nombre, string ruta)
+        {
+            lock (lockRutas)
+                if (ruta != "" && rutasVistas.Add(nombre + "|" + ruta) && logRutas != null)
+                    logRutas.Linea(string.Join(",", Hora(DateTime.Now), pid, Q(nombre), Q(ruta)));
+        }
+
+        // Todo lo que ya estaba abierto al arrancar el monitor, con su ubicación
+        static void InventarioInicial(DateTime ahora)
+        {
+            var inv = new Registro(Path.Combine(DirSesion, "procesos_al_inicio.csv"), "fecha_hora,pid,pid_padre,padre,nombre,ruta,ram_mb,hilos");
+            string h = Hora(ahora);
+            var actual = procs.Actual;
+            foreach (var p in actual.Values.Where(x => x.Pid != 0).OrderBy(x => x.Nombre, StringComparer.OrdinalIgnoreCase))
+            {
+                InfoProc padre;
+                string np = actual.TryGetValue(p.PidPadre, out padre) ? padre.Nombre : "";
+                inv.Linea(string.Join(",", h, p.Pid, p.PidPadre, Q(np), Q(p.Nombre), Q(RutaDe(p)), F(p.WorkingSet / 1048576.0, 0), p.Hilos));
+            }
+            inv.Cerrar();
+            logRutas.Volcar();
+        }
+
+        static void AnotarAbierto(DateTime t, string nombre, string ruta, string padre)
+        {
+            lock (abiertos)
+            {
+                var a = new ProgramaAbierto();
+                a.Secuencia = ++secuenciaAbiertos;
+                a.Ruta = ruta;
+                a.Texto = t.ToString("HH:mm:ss", Inv) + "  " + nombre.PadRight(30) + " " +
+                    (ruta == "" ? "(sin ubicación: se cerró enseguida o Windows no la deja leer)" : ruta) +
+                    (padre == "" ? "" : "   ← lo abrió " + padre);
+                abiertos.AddFirst(a);
+                while (abiertos.Count > 300) abiertos.RemoveLast();
+            }
+        }
+
+        // Programas abiertos después de la secuencia indicada, del más antiguo al más nuevo
+        internal static ProgramaAbierto[] AbiertosDesde(long secuencia)
+        {
+            lock (abiertos) return abiertos.Where(x => x.Secuencia > secuencia).Reverse().ToArray();
+        }
+
         // Sin administrador: inicios y fines detectados comparando la lista de procesos de cada muestra
         static void RegistrarProcesosPorSondeo(DateTime ahora)
         {
@@ -520,7 +593,9 @@ namespace MonitorBateria
             {
                 InfoProc padre;
                 string np = procs.Actual.TryGetValue(p.PidPadre, out padre) ? padre.Nombre : "";
-                logNuevos.Linea(string.Join(",", h, "inicio", p.Pid, p.PidPadre, Q(np), Q(p.Nombre), Q(RutaProceso(p.Pid)), "", ""));
+                string ruta = RutaDe(p);
+                logNuevos.Linea(string.Join(",", h, "inicio", p.Pid, p.PidPadre, Q(np), Q(p.Nombre), Q(ruta), "", ""));
+                AnotarAbierto(ahora, p.Nombre, ruta, np);
             }
             foreach (var p in procs.Terminados)
             {
@@ -540,8 +615,11 @@ namespace MonitorBateria
                 lock (vivos) vivos[pid] = t;
                 InfoProc padre;
                 string np = procs.Actual.TryGetValue(ppid, out padre) ? padre.Nombre : "";
-                logNuevos.Linea(string.Join(",", Hora(t), "inicio", pid, ppid, Q(np), Q(Convert.ToString(o["ProcessName"])), Q(RutaProceso(pid)), "", ""));
+                string nombre = Convert.ToString(o["ProcessName"]), ruta = RutaProceso(pid);
+                logNuevos.Linea(string.Join(",", Hora(t), "inicio", pid, ppid, Q(np), Q(nombre), Q(ruta), "", ""));
                 logNuevos.Volcar();
+                AnotarRuta(pid, nombre, ruta);
+                AnotarAbierto(t, nombre, ruta, np);
             }
             catch { }
         }
@@ -575,7 +653,11 @@ namespace MonitorBateria
             var actual = procs.Actual;
             string h = Hora(ahora);
             foreach (var e in est.Take(6))
+            {
+                InfoProc p;
+                if (actual.TryGetValue(e.Pid, out p)) RutaDe(p);
                 logFps.Linea(string.Join(",", h, e.Pid, Q(NombreDe(actual, e.Pid)), e.Cuadros, F(e.Fps, 1), F(e.PromMs, 2), F(e.MaxMs, 2), F(e.P99Ms, 2)));
+            }
             if (est.Count > 0) logFps.Volcar();
             EstadoFps = "activo · " + fps.Eventos.ToString("N0", Es) + " cuadros contados";
 
@@ -926,7 +1008,7 @@ namespace MonitorBateria
                         "Cierre limpio del monitor: " + motivo + "\r\nHora: " + Hora(DateTime.Now) + "\r\n", new UTF8Encoding(true));
                 }
                 catch { }
-                foreach (var r in new[] { logSistema, logProcesos, logNuevos, logFps, logMsi, logEventos }) if (r != null) r.Cerrar();
+                foreach (var r in new[] { logSistema, logProcesos, logNuevos, logFps, logMsi, logRutas, logEventos }) if (r != null) r.Cerrar();
                 try { File.Delete(archivoActiva); } catch { }
                 if (nv != null) nv.Parar();
             }
@@ -1166,7 +1248,8 @@ namespace MonitorBateria
         readonly Panel cabecera;
         readonly Label lblEstado, lblDetalle, lblModo, lblAviso;
         readonly Dictionary<string, Label> valores = new Dictionary<string, Label>();
-        readonly ListBox lstEventos;
+        readonly ListBox lstEventos, lstAbiertos;
+        long ultimoAbierto;
         readonly NotifyIcon bandeja;
         readonly System.Windows.Forms.Timer reloj;
         readonly Icon icVerde, icAmbar, icRojo;
@@ -1242,13 +1325,22 @@ namespace MonitorBateria
             };
             raiz.Controls.Add(tabla, 0, 3);
 
-            raiz.Controls.Add(new Label { Text = "Últimos eventos", AutoSize = true, Font = new Font("Segoe UI Semibold", 9.5f), Margin = new Padding(S(12), S(8), 0, S(2)) }, 0, 4);
-            lstEventos = new ListBox
+            raiz.Controls.Add(new Label
             {
-                Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Consolas", 9f), Margin = new Padding(S(12), 0, S(12), 0),
-                BorderStyle = BorderStyle.FixedSingle, HorizontalScrollbar = true
-            };
-            raiz.Controls.Add(lstEventos, 0, 5);
+                Text = "En «Programas que se abren», doble clic en uno para ver su archivo en el Explorador.", AutoSize = true,
+                ForeColor = Color.FromArgb(105, 105, 105), Margin = new Padding(S(12), S(8), 0, S(2))
+            }, 0, 4);
+            var pestanas = new TabControl { Dock = DockStyle.Fill, Margin = new Padding(S(12), 0, S(12), 0) };
+            lstEventos = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Consolas", 9f), BorderStyle = BorderStyle.None, HorizontalScrollbar = true };
+            lstAbiertos = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, Font = new Font("Consolas", 9f), BorderStyle = BorderStyle.None, HorizontalScrollbar = true };
+            lstAbiertos.DoubleClick += (s, e) => MostrarEnExplorador(lstAbiertos.SelectedItem as ProgramaAbierto);
+            var pEventos = new TabPage("Últimos eventos");
+            var pAbiertos = new TabPage("Programas que se abren y su ubicación");
+            pEventos.Controls.Add(lstEventos);
+            pAbiertos.Controls.Add(lstAbiertos);
+            pestanas.TabPages.Add(pEventos);
+            pestanas.TabPages.Add(pAbiertos);
+            raiz.Controls.Add(pestanas, 0, 5);
 
             var botones = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(S(10), S(8), S(10), S(10)), Margin = Padding.Empty };
             var btnDetener = new Button { Text = "Detener y cerrar", AutoSize = true, FlatStyle = FlatStyle.System };
@@ -1360,6 +1452,16 @@ namespace MonitorBateria
                 lstEventos.EndUpdate();
             }
 
+            // Los nuevos se insertan arriba sin rehacer la lista, para no perder la selección
+            var nuevos = Program.AbiertosDesde(ultimoAbierto);
+            if (nuevos.Length > 0)
+            {
+                lstAbiertos.BeginUpdate();
+                foreach (var a in nuevos) { lstAbiertos.Items.Insert(0, a); ultimoAbierto = a.Secuencia; }
+                while (lstAbiertos.Items.Count > 300) lstAbiertos.Items.RemoveAt(lstAbiertos.Items.Count - 1);
+                lstAbiertos.EndUpdate();
+            }
+
             if (captura != null && ticks == 8)
                 try
                 {
@@ -1392,6 +1494,18 @@ namespace MonitorBateria
             Show();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Activate();
+        }
+
+        void MostrarEnExplorador(ProgramaAbierto a)
+        {
+            if (a == null) return;
+            if (a.Ruta == "" || !File.Exists(a.Ruta))
+            {
+                MessageBox.Show(this, a.Ruta == "" ? "Windows no dio la ubicación de este programa: se cerró enseguida o está protegido. Con permisos de administrador se obtienen más ubicaciones."
+                    : "El archivo ya no existe:\n" + a.Ruta, "Monitor de batería", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try { Process.Start("explorer.exe", "/select,\"" + a.Ruta + "\""); } catch { }
         }
 
         void AbrirCarpeta()
@@ -1452,6 +1566,14 @@ namespace MonitorBateria
                 return Icon.FromHandle(bmp.GetHicon());
             }
         }
+    }
+
+    // Un programa que se abrió, tal como se muestra en la pestaña de la ventana
+    sealed class ProgramaAbierto
+    {
+        public long Secuencia;
+        public string Texto, Ruta;
+        public override string ToString() { return Texto; }
     }
 
     // ---------------------------------------------------------------------- lectura de cada muestra
